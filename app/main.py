@@ -146,3 +146,24 @@ def list_events(req: EventsQuery):
     except Exception as e:
         # אפשר להחליף ל-HTTPException(500) אם תרצה לכפות קוד שגיאה
         return EventsResponse(ok=False, events=[])
+
+
+# --- OAuth start: מחזיר קישור התחברות ---
+@app.get("/oauth2/start")
+def oauth2_start():
+    try:
+        url = get_auth_url()
+        return {"ok": True, "auth_url": url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- OAuth callback: גוגל מחזירה ?code= ---
+@app.get("/oauth2callback")
+def oauth2_callback(code: str | None = None):
+    if not code:
+        return HTMLResponse("<h3>Missing ?code</h3>", status_code=400)
+    try:
+        exchange_code_for_token(code)
+        return HTMLResponse("<h3>Authorization completed. You can close this tab.</h3>", status_code=200)
+    except Exception as e:
+        return HTMLResponse(f"<h3>OAuth error: {e}</h3>", status_code=500)
