@@ -158,12 +158,18 @@ def oauth2_start():
         raise HTTPException(status_code=500, detail=str(e))
 
 # --- OAuth callback: גוגל מחזירה ?code= ---
+from fastapi.responses import HTMLResponse
+import traceback
+
 @app.get("/oauth2callback")
 def oauth2_callback(code: str | None = None):
     if not code:
         return HTMLResponse("<h3>Missing ?code</h3>", status_code=400)
     try:
-        exchange_code_for_token(code)
-        return HTMLResponse("<h3>Authorization completed. You can close this tab.</h3>", status_code=200)
+        path = exchange_code_for_token(code)
+        return HTMLResponse(f"<h3>Authorization completed. Token saved to {path}.</h3>", status_code=200)
     except Exception as e:
-        return HTMLResponse(f"<h3>OAuth error: {e}</h3>", status_code=500)
+        tb = traceback.format_exc()
+        # הדפס ללוגים של Render כדי לראות
+        print("OAUTH ERROR:", e, tb)
+        return HTMLResponse(f"<h3>OAuth error: {e}</h3><pre>{tb}</pre>", status_code=500)
