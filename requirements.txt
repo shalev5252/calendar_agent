@@ -1,11 +1,18 @@
 fastapi
-uvicorn[standard]
+uvicorn
 gunicorn
-openai
 python-dotenv
+
+# Google APIs
 google-api-python-client
-google-auth-httplib2
-google-auth-oauthlib
 google-auth
+google-auth-oauthlib
+google-auth-httplib2
+
+# OpenAI
+openai
+
+# Utilities
+requests
 pydantic
 httpx
