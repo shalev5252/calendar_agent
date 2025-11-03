@@ -1,0 +1,108 @@
+# === Python / FastAPI ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.log
+*.sqlite3
+*.db
+
+# Virtual environment
+venv/
+.env/
+.env.local
+.env.*.backup
+.envrc
+.DS_Store
+
+# Local secrets and API keys
+*.env
+*.key
+*.pem
+*.crt
+*.token
+*.json
+token.json
+credentials.json
+client_secret*.json
+
+# Google OAuth tokens and credentials
+*.pickle
+*.pkl
+*.bak
+*.cache/
+.google-token/
+google_token.json
+google_credentials.json
+
+# IDE / Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test artifacts
+coverage/
+.pytest_cache/
+htmlcov/
+reports/
+*.pytest_cache
+*.pytest_cache/*
+*.coverage
+tests/__pycache__/
+
+# Compiled or temporary files
+build/
+dist/
+*.egg-info/
+*.spec
+*.out
+*.tmp
+
+# === Node / Flutter ===
+# Flutter build outputs
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+coverage/
+*.lock
+
+# Platform-specific build dirs
+android/app/build/
+ios/Pods/
+ios/.symlinks/
+ios/Flutter/Flutter.framework
+ios/Flutter/Flutter.podspec
+ios/Flutter/App.framework
+ios/ServiceDefinitions.json
+
+# IDEs (Android Studio / Xcode)
+*.iml
+.gradle/
+.idea/
+DerivedData/
+xcuserdata/
+*.xcworkspace
+
+# Flutter environment files
+.flutter-plugins
+.flutter-plugins-dependencies
+generated_plugin_registrant.dart
+.env.dart
+
+# === Miscellaneous ===
+*.bak
+*.tmp
+*.log
+*.orig
+*.rej
+
+# === Custom additions for this project ===
+# Don’t commit local Google credentials or private API keys
+google_calendar_agent/tools/credentials.json
+google_calendar_agent/tools/token.json
+google_calendar_agent/.env
