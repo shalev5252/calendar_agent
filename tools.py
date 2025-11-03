@@ -33,11 +33,9 @@ def get_calendar_service():
 
     return build("calendar", "v3", credentials=creds)
 
-import os
 import json
 import tempfile
 from google_auth_oauthlib.flow import Flow
-from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 
 # ----------------------------------------------------
