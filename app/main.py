@@ -10,7 +10,7 @@ from contextlib import redirect_stdout
 import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))  # מאפשר גישה לקובץ agent.py
 import agent
-from tools import get_calendar_service
+from tools import get_calendar_service, get_auth_url, exchange_code_for_token  # ← חשוב
 
 
 app = FastAPI(title="Google Calendar Agent API", version="1.0")
