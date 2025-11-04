@@ -327,31 +327,74 @@ def handle_query(service, question, filters):
         orderBy='startTime'
     ).execute()
 
-    events = events_result.get('items', [])
-    if not events:
-        print("No events found in the specified range.")
+    items = events_result.get('items', [])
+    if not items:
+        print("Answer: לא נמצאו אירועים בתחום התאריכים שביקשת.")
         return
 
-    messages = [
-        {"role": "system", "content": (
-            "You are an AI assistant analyzing a user's Google Calendar.\n"
-            "You will receive a natural language request and a list of events (each with title and start time).\n"
-            "Understand whether the user wants to query, delete, or do both.\n\n"
-            "Instructions:\n"
-            "- If the user says 'clear my day', 'delete everything', or similar, return all event titles from the list.\n"
-            "- You can also respond with an answer (e.g., for 'how many' questions).\n\n"
-            "Output must be a single valid JSON object.\n"
-            "Examples:\n"
-            "{ \"delete_titles\": [\"Event 1\", \"Event 2\"] }\n"
-            "{ \"answer\": \"You have 3 Arabic classes.\" }\n"
-            "{ \"answer\": \"You have 3 events tomorrow.\", \"delete_titles\": [\"Event 1\"] }"
-        )},
-        {"role": "user", "content": f"User query: {question}\n\nEvents:\n{json.dumps(events, indent=2)}"}
-    ]
+    # הקרנה רזה של האירועים – נותנים למודל חומר גלם נקי
+    slim = []
+    for ev in items:
+        slim.append({
+            "title": ev.get("summary") or "",
+            "start": ev.get("start", {}).get("dateTime") or ev.get("start", {}).get("date"),
+            "end": ev.get("end", {}).get("dateTime") or ev.get("end", {}).get("date"),
+            "location": ev.get("location") or "",
+            "description": ev.get("description") or "",
+            "recurring": bool(ev.get("recurringEventId")),
+        })
+
+    sys_msg = (
+        "You are a careful, multilingual calendar analyst. "
+        "You receive a natural-language query and a JSON array of events with keys: "
+        "title, start, end, location, description, recurring.\n\n"
+
+        "Your job:\n"
+        "1) Understand complex intent (query/delete/both), including multi-criteria filters: "
+        "   time ranges, text, people, locations, durations, overlaps, etc.\n"
+        "2) Perform semantic & geographic reasoning WITHOUT external tools: "
+        "   treat phrases like 'near/around/in the area of X' using general world knowledge. "
+        "   Accept neighborhood names, transliterations, common aliases, and nearby cities "
+        "   reasonably associated with X. Do fuzzy matching when sensible.\n"
+        "3) Do calculations: counts, durations, earliest/latest, overlaps/conflicts, totals per day, etc.\n"
+        "4) Recurring events: do not list each occurrence unless explicitly requested. "
+        "   Summarize recurring items at the end (e.g., 'Remember: \"Meditation\" — every morning').\n"
+        "5) Language: detect the user's language from the query and respond in the SAME language. "
+        "   Be polite, concise, and human-like. Use 24-hour time and dd/MM/yyyy dates in the prose.\n"
+        "6) Formatting for multi-line answers: one event per line, sorted by start time, no bullets/markdown.\n\n"
+
+        "Deletion intent:\n"
+        "- If the user clearly wants deletion, return exact titles under \"delete_titles\". "
+        "  You may also include a polite summary in \"answer\".\n\n"
+
+        "Output: return a SINGLE valid JSON object only. Allowed keys: "
+        "\"answer\" (string) and/or \"delete_titles\" (array of strings). "
+        "If not deleting, omit \"delete_titles\". If no answer is needed, omit \"answer\".\n\n"
+
+        "Examples (schema only, DO NOT copy wording):\n"
+        "{ \"answer\": \"...\" }\n"
+        "{ \"answer\": \"...\", \"delete_titles\": [\"Title A\", \"Title B\"] }\n"
+        "{ \"delete_titles\": [\"Title A\"] }\n"
+    )
+
+    user_msg = {
+        "role": "user",
+        "content": (
+            f"User query:\n{question}\n\n"
+            f"Date range:\nfrom={from_time}\n to={to_time}\n\n"
+            f"Events JSON:\n{json.dumps(slim, ensure_ascii=False)}\n"
+            "Return ONLY a single JSON object as specified."
+        )
+    }
 
     response = client.chat.completions.create(
         model="gpt-4o",
-        messages=messages
+        # אפשר להקשיח מעט כדי לקבל פלט יציב
+        temperature=0.2,
+        messages=[
+            {"role": "system", "content": sys_msg},
+            user_msg
+        ]
     )
 
     reply = clean_json_response(response.choices[0].message.content.strip())
@@ -362,13 +405,16 @@ def handle_query(service, question, filters):
         print("GPT returned invalid JSON:\n", reply)
         return
 
-    if "answer" in result:
-        print("Answer:", result["answer"])
+    # שולחים לאפליקציה תשובה מלאה (רב-שורתית אם צריך)
+    if isinstance(result.get("answer"), str) and result["answer"].strip():
+        print("Answer:", result["answer"].strip())
 
-    if "delete_titles" in result:
-        delete_titles = result["delete_titles"]
-        print(f"Preparing to delete {len(delete_titles)} matching titles.")
-        delete_event_by_titles(service, from_time, to_time, delete_titles)
+    # מחיקה לפי כותרות (אופציונלי)
+    if isinstance(result.get("delete_titles"), list):
+        delete_titles = [t for t in result["delete_titles"] if isinstance(t, str) and t.strip()]
+        if delete_titles:
+            print(f"Preparing to delete {len(delete_titles)} matching titles.")
+            delete_event_by_titles(service, from_time, to_time, delete_titles)
 
 # ----------------------------- execution layer -----------------------------
 
