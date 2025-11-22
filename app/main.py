@@ -167,12 +167,26 @@ def oauth2_callback(code: str | None = None):
         return HTMLResponse("<h3>Missing ?code</h3>", status_code=400)
     try:
         path = exchange_code_for_token(code)
-        return HTMLResponse(f"<h3>Authorization completed. Token saved to {path}.</h3>", status_code=200)
+
+        html = """
+        <html>
+        <body>
+            <h3>Authorization completed. You may close this window.</h3>
+            <script>
+                setTimeout(function() {
+                    window.close();
+                }, 500);
+            </script>
+        </body>
+        </html>
+        """
+        return HTMLResponse(html, status_code=200)
+
     except Exception as e:
         tb = traceback.format_exc()
-        # הדפס ללוגים של Render כדי לראות
         print("OAUTH ERROR:", e, tb)
         return HTMLResponse(f"<h3>OAuth error: {e}</h3><pre>{tb}</pre>", status_code=500)
+
 
 @app.get("/auth/status")
 def auth_status():
