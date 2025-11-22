@@ -106,3 +106,7 @@ generated_plugin_registrant.dart
 google_calendar_agent/tools/credentials.json
 google_calendar_agent/tools/token.json
 google_calendar_agent/.env
+
+# Local CLI tokens
+.tokens/
+credentials.local.json

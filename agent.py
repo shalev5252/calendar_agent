@@ -243,6 +243,11 @@ Always return valid JSON only — no markdown, no explanations, and no text outs
 
 # ----------------------------- utilities -----------------------------
 
+""" 
+    utility function to clean JSON responses from the LLM
+    input: string - Json content possibly wrapped in markdown or code fences
+    output: string - Cleaned JSON content
+"""
 def clean_json_response(content: str) -> str:
     content = content.strip()
     if content.startswith("```"):
@@ -255,8 +260,12 @@ def clean_json_response(content: str) -> str:
 
 # ----------------------------- LLM parse -----------------------------
 
+"""
+  the function gets a prompt and returns a dictionary of actions or commands the agent should perform
+  input: prompt string
+  output: dictionary with either 'command' or 'actions' keys
+"""
 def parse_event(prompt: str) -> Dict[str, Any]:
-    """שולח את הפרומפט ל־LLM ומחזיר את ה־JSON הגולמי (command אחד או actions[])"""
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
@@ -269,24 +278,29 @@ def parse_event(prompt: str) -> Dict[str, Any]:
     cleaned = clean_json_response(raw_content)
     return json.loads(cleaned)
 
+
+"""
+  the function will use parse the promnpt and return a list of actions to perform
+  input: prompt string
+  output: list of actions
+"""
 def plan_actions(prompt: str) -> List[Dict[str, Any]]:
-    """
-    שלב 1: תכנון בלבד.
-    מקבל prompt ומחזיר רשימת פעולות אחידה לביצוע (list of commands),
-    בלי לבצע כלום. לשימוש ישיר ע״י /parse.
-    """
     data = parse_event(prompt)
     if "actions" in data and isinstance(data["actions"], list):
         return data["actions"]
     elif "command" in data:
-        # להחזיר בפורמט אחיד תמיד: list of commands
         return [data]
     else:
-        # לא נמצא מבנה חוקי—נחזיר רשימה ריקה (או אפשר לזרוק חריגה, תלוי ב־API)
         return []
 
-# ----------------------------- calendar ops -----------------------------
+# ----------------------------- google calendar api operatios -----------------------------
 
+"""
+  the function will add an event or a list of events to the google calendar
+  input: service - google calendar service object
+        event_json - a single event object or a list of event objects
+  output: None
+"""
 def add_event(service, event_json):
     if isinstance(event_json, list):
         for event in event_json:
@@ -296,6 +310,15 @@ def add_event(service, event_json):
         result = service.events().insert(calendarId='primary', body=event_json).execute()
         print(f"Event Created: {result.get('htmlLink')}")
 
+
+"""
+  the function will recieve all the events in the given time range and delete those matching the given titles
+  input:  service - google calendar service object
+          from_time - RFC3339 string
+          to_time - RFC3339 string
+          titles_to_delete - list of event titles to delete
+  output: None
+"""
 def delete_event_by_titles(service, from_time, to_time, titles_to_delete):
     events_result = service.events().list(
         calendarId='primary',
@@ -315,6 +338,14 @@ def delete_event_by_titles(service, from_time, to_time, titles_to_delete):
             except Exception as e:
                 print(f"Failed to delete '{title}': {e}")
 
+
+"""
+  the function will handle a query command: it will fetch events in the given time range, use the LLM to process the question and print the answer.
+  input:  service - google calendar service object
+          question - string (the user's natural language question)
+          filters - dictionary with ifnormation required to filter events (from, to)
+  output: None
+"""
 def handle_query(service, question, filters):
     from_time = filters["from"]
     to_time = filters["to"]
@@ -329,10 +360,9 @@ def handle_query(service, question, filters):
 
     items = events_result.get('items', [])
     if not items:
-        print("Answer: לא נמצאו אירועים בתחום התאריכים שביקשת.")
+        print("Answer: no events found in the given time range.")
         return
 
-    # הקרנה רזה של האירועים – נותנים למודל חומר גלם נקי
     slim = []
     for ev in items:
         slim.append({
@@ -389,7 +419,6 @@ def handle_query(service, question, filters):
 
     response = client.chat.completions.create(
         model="gpt-4o",
-        # אפשר להקשיח מעט כדי לקבל פלט יציב
         temperature=0.2,
         messages=[
             {"role": "system", "content": sys_msg},
@@ -418,6 +447,7 @@ def handle_query(service, question, filters):
 
 # ----------------------------- execution layer -----------------------------
 
+
 def process_command(service, command_data):
     cmd = command_data.get("command")
     if cmd == "add_event":
@@ -431,7 +461,6 @@ def process_command(service, command_data):
         handle_query(service, command_data["question"], command_data["filters"])
 
     elif cmd == "general_answer":
-        # לא נדרשת אינטראקציה עם גוגל – רק הדפס ללוג כדי שהאפליקציה תחטוף ותציג
         ans = command_data.get("answer") or ""
         if ans:
             print("Answer:", ans)
@@ -442,20 +471,14 @@ def process_command(service, command_data):
         print("Unknown command:", cmd)
 
 def execute_actions(actions: List[Dict[str, Any]], service):
-    """
-    שלב 2: ביצוע.
-    מקבל את רשימת הפקודות (כמו שחוזרת מ-plan_actions) ומריץ אותן.
-    אם לא סופק service – ייווצר ברירת מחדל דרך get_calendar_service().
-    """
     actions = normalize_actions_timezone(actions)
-
     for action in actions:
         process_command(service, action)
 
 
 
+# ----------------------------- time zones normalization for world clock -----------------------------
 
-# agent.py
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import re
@@ -477,11 +500,6 @@ def _to_rfc3339_with_tz(local_dt_str: str, tzid: str) -> str:
     return aware.isoformat()
 
 def _normalize_event_times(event_obj: dict) -> dict:
-    """
-    מנרמל start/end של אירוע בודד:
-    - אם יש timeZone -> נחשב offset נכון לתאריך
-    - נתעלם מ-offset שגוי שמגיע מהמודל
-    """
     start = event_obj.get("start") or {}
     end = event_obj.get("end") or {}
 
@@ -502,11 +520,6 @@ def _normalize_event_times(event_obj: dict) -> dict:
     return event_obj
 
 def normalize_actions_timezone(actions: list[dict]) -> list[dict]:
-    """
-    עובר על כל הפעולות ומתקן תאריכים:
-    - add_event: מנרמל כל event.start/end
-    - delete/query: אם יש filters.from/to – מנרמל לשעה המקומית עם offset נכון
-    """
     fixed = []
     for a in actions:
         cmd = a.get("command")
@@ -533,17 +546,18 @@ def normalize_actions_timezone(actions: list[dict]) -> list[dict]:
 
 
 # ----------------------------- cli helper -----------------------------
-
 if __name__ == "__main__":
-    # שלב 1: תכנון בלבד
+    import cli_auth  # ← הוספה: משתמשים בכלי ה-CLI המקומי
+
     prompt = input("Enter your calendar instruction: \n")
     actions = plan_actions(prompt)
     print("Planned actions (no execution):")
     print(json.dumps({"actions": actions}, ensure_ascii=False, indent=2))
 
-    # שלב 2: ביצוע (רק אם תרצה)
     yn = input("Execute planned actions? [y/N]: ").strip().lower()
     if yn == "y":
-        execute_actions(actions)
+        # חדש: מקבלים service מקומי מהכלי הייעודי
+        service = cli_auth.get_calendar_service_local()
+        execute_actions(actions, service=service)  # ← אין שינוי לחתימה הקיימת
     else:
         print("Skipped execution.")

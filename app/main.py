@@ -173,3 +173,19 @@ def oauth2_callback(code: str | None = None):
         # הדפס ללוגים של Render כדי לראות
         print("OAUTH ERROR:", e, tb)
         return HTMLResponse(f"<h3>OAuth error: {e}</h3><pre>{tb}</pre>", status_code=500)
+
+@app.get("/auth/status")
+def auth_status():
+    """
+    בודק אם קיימת הרשאת Google Calendar תקפה.
+    מחזיר:
+    { "ok": true } אם יש token תקין
+    { "ok": false } אם אין או פג תוקף
+    """
+    try:
+        service = get_calendar_service()   # יזרוק חריגה אם אין הרשאה
+        # בדיקה בסיסית שמבצעת קריאה קטנה ליומן
+        service.calendarList().list(maxResults=1).execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
