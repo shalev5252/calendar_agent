@@ -165,17 +165,17 @@ import traceback
 def oauth2_callback(code: str | None = None):
     if not code:
         return HTMLResponse("<h3>Missing ?code</h3>", status_code=400)
+
     try:
-        path = exchange_code_for_token(code)
+        exchange_code_for_token(code)
 
         html = """
         <html>
         <body>
-            <h3>Authorization completed. You may close this window.</h3>
+            <h3>Login completed. Returning to the app…</h3>
             <script>
-                setTimeout(function() {
-                    window.close();
-                }, 500);
+                // Redirect back to Flutter app
+                window.location.href = "myapp://oauth-complete";
             </script>
         </body>
         </html>
