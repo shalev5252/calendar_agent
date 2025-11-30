@@ -20,6 +20,11 @@ You support four commands:
 3. "query_event" — to query events based on a natural language question and date range
 4. "general_answer" — to politely answer general knowledge questions that are NOT about the calendar (e.g., translations, facts, how-to)
 
+You also support recurring events and color:
+- recurrence: object describing RFC5545 rule
+- allDay: true/false
+- color: either a known color name (lavender, sage, grape, flamingo, banana, tangerine, peacock, graphite, blueberry, basil, tomato) or a Google Calendar colorId string ("1".."11")
+
 You may return multiple commands by wrapping them in an array under the key "actions":
 
 Example:
@@ -48,6 +53,28 @@ For adding:
         "dateTime": "YYYY-MM-DDTHH:MM:SS",
         "timeZone": "Asia/Jerusalem"
       }}
+    }}
+  ]
+}}
+
+For recurring events and color (optional fields):
+{{
+  "command": "add_event",
+  "events": [
+    {{
+      "summary": "<title>",
+      "allDay": true|false,
+      "start": {{ "dateTime": "YYYY-MM-DDTHH:MM:SS", "timeZone": "Asia/Jerusalem" }} OR {{ "date": "YYYY-MM-DD" }},
+      "end":   {{ "dateTime": "YYYY-MM-DDTHH:MM:SS", "timeZone": "Asia/Jerusalem" }} OR {{ "date": "YYYY-MM-DD" }},
+      "recurrence": {{
+        "freq": "DAILY|WEEKLY|MONTHLY|YEARLY",
+        "interval": 1,
+        "byDay": ["MO","TU","WE","TH","FR","SA","SU"],         // optional
+        "byMonthDay": [1,15,30],                                // optional
+        "count": 10,                                            // optional
+        "until": "YYYYMMDDT000000Z"                             // optional (UTC, no colons)
+      }},
+      "color": "tomato" | "lavender" | "7" | "11"               // optional
     }}
   ]
 }}
@@ -525,9 +552,24 @@ def normalize_actions_timezone(actions: list[dict]) -> list[dict]:
         cmd = a.get("command")
         if cmd == "add_event":
             events = a.get("events") or []
-            events = [_normalize_event_times(dict(ev)) for ev in events]
+            normed = []
+            for ev in events:
+                ev = dict(ev)
+
+                # 1) אם allDay – הפוך ל-date/date + הפוך ליום הבא
+                if ev.get("allDay"):
+                    ev = _ensure_all_day_dates(ev)
+                else:
+                    # אחרת – שמור את ה-RFC3339 עם אזור הזמן (הקיים שלך)
+                    ev = _normalize_event_times(ev)
+
+                # 2) Recurrence + Color
+                ev = _apply_recurrence_and_color(ev)
+
+                normed.append(ev)
+
             na = dict(a)
-            na["events"] = events
+            na["events"] = normed
             fixed.append(na)
 
         elif cmd in ("delete_event", "query_event"):
@@ -543,6 +585,143 @@ def normalize_actions_timezone(actions: list[dict]) -> list[dict]:
         else:
             fixed.append(a)
     return fixed
+
+
+# ---------- Recurrence & Color helpers ----------
+
+# מיפוי שמות -> colorId לפי פלטת ברירת המחדל של גוגל
+_GOOGLE_EVENT_COLORS = {
+    "lavender": "1",
+    "sage": "2",
+    "grape": "3",
+    "flamingo": "4",
+    "banana": "5",
+    "tangerine": "6",
+    "peacock": "7",
+    "graphite": "8",
+    "blueberry": "9",
+    "basil": "10",
+    "tomato": "11",
+}
+
+def _coerce_color_id(value: str | int) -> str | None:
+    """
+    מחזיר colorId חוקי ("1".."11") או None אם לא הצליח.
+    תומך בשם (tomato) או במספר.
+    """
+    if value is None:
+        return None
+    if isinstance(value, int):
+        s = str(value)
+        return s if s in _GOOGLE_EVENT_COLORS.values() else None
+    v = str(value).strip().lower()
+    if v in _GOOGLE_EVENT_COLORS:
+        return _GOOGLE_EVENT_COLORS[v]
+    if v in _GOOGLE_EVENT_COLORS.values():
+        return v
+    return None
+
+def _build_rrule(recur: dict) -> list[str]:
+    """
+    מקבל אובייקט recurrence ברמת הסוכן ובונה RRULE אחד (ברשימה) לפי RFC5545.
+    דוגמה: {"freq":"WEEKLY","byDay":["MO","WE"],"interval":1,"count":10,"until":"20260101T000000Z"}
+    """
+    if not isinstance(recur, dict):
+        return []
+
+    parts = []
+    freq = (recur.get("freq") or "").upper().strip()
+    if freq not in {"DAILY","WEEKLY","MONTHLY","YEARLY"}:
+        return []
+    parts.append(f"FREQ={freq}")
+
+    interval = recur.get("interval")
+    if isinstance(interval, int) and interval > 0:
+        parts.append(f"INTERVAL={interval}")
+
+    by_day = recur.get("byDay")
+    if isinstance(by_day, list) and by_day:
+        # ודא פורמט ימי השבוע (MO,TU,WE,TH,FR,SA,SU)
+        days = []
+        for d in by_day:
+            dv = str(d).upper().strip()
+            if dv in {"MO","TU","WE","TH","FR","SA","SU"}:
+                days.append(dv)
+        if days:
+            parts.append("BYDAY=" + ",".join(days))
+
+    by_md = recur.get("byMonthDay")
+    if isinstance(by_md, list) and by_md:
+        ints = [str(int(x)) for x in by_md if isinstance(x, int)]
+        if ints:
+            parts.append("BYMONTHDAY=" + ",".join(ints))
+
+    count = recur.get("count")
+    if isinstance(count, int) and count > 0:
+        parts.append(f"COUNT={count}")
+
+    until = recur.get("until")
+    if isinstance(until, str) and until.strip():
+        # מצופה בפורמט UTC כמו 20260101T000000Z
+        parts.append(f"UNTIL={until.strip()}")
+
+    rule = "RRULE:" + ";".join(parts)
+    return [rule]
+
+
+from datetime import timedelta
+
+def _ensure_all_day_dates(event_obj: dict) -> dict:
+    """
+    אם allDay=True – נשתמש בשדות date (ללא שעה) ונדאג שה-end יהיה day+1 (אקסקלוסיבי).
+    """
+    if not event_obj.get("allDay"):
+        return event_obj
+
+    # תיעדוף: start.date אם קיים אחרת נגזור מ-dateTime
+    start = event_obj.get("start") or {}
+    end = event_obj.get("end") or {}
+
+    def _extract_date(d):
+        if "date" in d and d["date"]:
+            return datetime.fromisoformat(d["date"]).date()
+        dt = d.get("dateTime")
+        if dt:
+            return datetime.fromisoformat(dt).date()
+        return None
+
+    s_date = _extract_date(start)
+    if not s_date:
+        # אם לא נמסר start בכלל, נשתמש בהיום
+        s_date = datetime.now().date()
+
+    e_date = s_date + timedelta(days=1)
+
+    event_obj["start"] = {"date": s_date.isoformat()}
+    event_obj["end"]   = {"date": e_date.isoformat()}
+
+    # אל תכניס timeZone עבור all-day (Google לא צריך)
+    event_obj.pop("allDay", None)
+    return event_obj
+
+def _apply_recurrence_and_color(event_obj: dict) -> dict:
+    """
+    בונה RRULE אם נמסר recurrence ומיישם colorId אם נמסר צבע.
+    """
+    # Color
+    color_val = event_obj.pop("color", None)
+    color_id = _coerce_color_id(color_val)
+    if color_id:
+        event_obj["colorId"] = color_id
+
+    # Recurrence
+    recur = event_obj.pop("recurrence", None)
+    if isinstance(recur, dict):
+        rules = _build_rrule(recur)
+        if rules:
+            event_obj["recurrence"] = rules
+
+    return event_obj
 
 
 # ----------------------------- cli helper -----------------------------
