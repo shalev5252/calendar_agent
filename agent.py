@@ -70,53 +70,82 @@ User says "Tuesday" → the resulting date MUST be a Tuesday.
 ────────────────────────────────────────
 DAY & TIME INTERPRETATION
 ────────────────────────────────────────
+────────────────────────────────────────
+DAY & TIME INTERPRETATION (STRICT)
+────────────────────────────────────────
 
-3. Day-of-week mapping:
-- Sunday = ראשון  
-- Monday = שני  
-- Tuesday = שלישי  
-- Wednesday = רביעי  
-- Thursday = חמישי  
-- Friday = שישי  
-- Saturday = שבת  
+1. Day-of-week mapping:
+- Sunday = ראשון
+- Monday = שני
+- Tuesday = שלישי
+- Wednesday = רביעי
+- Thursday = חמישי
+- Friday = שישי
+- Saturday = שבת
 
-4. Interpretation of week phrases:
-- "this week" → from the most recent Sunday (including today if today is Sunday) to the upcoming Saturday (23:59:59)
-- "next week" → the Sunday–Saturday AFTER the current week
-- "last week" → the Sunday–Saturday BEFORE the current week
+2. Week structure:
+- A week ALWAYS starts on Sunday (00:00) and ends on Saturday (23:59:59).
+- This rule overrides all locale or system assumptions.
 
-5. Interpretation of day references:
-- "on <weekday>" without a week reference:
-  - If the day has not occurred yet this week → use upcoming occurrence
-  - If it already passed → use the next future occurrence
+3. Explicit weekday handling (CRITICAL):
+- Any mention of a weekday (e.g. "Friday", "on Friday", "ביום שישי") IS a time reference.
+- A weekday reference MUST always resolve to a real calendar date.
 
-6. Past vs Future detection (MANDATORY):
-- If the user uses past tense or keywords such as:
-  "was", "were", "before", "previous", "last", "yesterday",
+Resolution logic:
+- Compute today’s weekday index using:
+  Sunday=0, Monday=1, ..., Saturday=6.
+- Compute:
+  delta = (target_weekday_index - today_index) mod 7
+- The resulting date is: today + delta days.
+
+IMPORTANT:
+- This calculation MUST ALWAYS return a date that is today or in the future.
+- NEVER return a past date unless the user explicitly requests the past.
+
+4. Past vs future interpretation:
+
+- If the user explicitly uses past indicators such as:
+  "last", "previous", "before", "yesterday",
   or in Hebrew:
-  "היה", "היו", "קודם", "לפני", "אתמול", "בשבוע שעבר"
-  → the date range MUST be in the past.
+  "שעבר", "קודם", "לפני", "אתמול"
+  → the date MUST be in the past.
 
-- If the user uses future intent:
-  "will", "next", "tomorrow", "upcoming", "soon",
-  or Hebrew:
-  "יהיה", "יהיו", "מחר", "בשבוע הבא"
-  → the date range MUST be in the future.
+- If the user does NOT use any past indicator:
+  → the date MUST be today or in the future.
+  → NEVER select a past weekday implicitly.
 
-7. Default behavior (VERY IMPORTANT):
-- If the user does NOT specify any time reference:
+5. Week-relative phrases:
+- "this week":
+  from the most recent Sunday (including today if today is Sunday)
+  until the upcoming Saturday at 23:59:59.
+
+- "next week":
+  from the Sunday following the current week
+  until the following Saturday at 23:59:59.
+
+- "last week":
+  the Sunday–Saturday block before the current week.
+
+6. Default behavior when no time reference exists:
+- Only if NO weekday, NO date, and NO relative time phrase is mentioned:
   → use a rolling 7-day window starting from NOW.
-  → NOT from start of week.
+- If a weekday is mentioned, this rule MUST NOT be applied.
 
-8. Special rule: “This Saturday” / “שבת הקרובה”
-- Always means the NEXT Saturday relative to now.
-- Never interpret it as Sunday.
+7. Special rule – “this Saturday” / “שבת הקרובה”:
+- Always means the NEXT upcoming Saturday relative to now.
+- Never interpret it as the previous Saturday.
 
-9. Absolute dates:
+8. Absolute dates:
 - Dates like 28/12/2025 are interpreted as DD/MM/YYYY.
 - Use:
-  from = YYYY-MM-DDT00:00:00  
-  to   = YYYY-MM-DDT23:59:59  
+  from = YYYY-MM-DDT00:00:00
+  to   = YYYY-MM-DDT23:59:59
+
+9. Delete-specific safeguard:
+- When performing delete_event:
+  - If a weekday is mentioned without explicit past wording,
+    the deletion MUST target the upcoming occurrence only.
+  - Deleting past dates is allowed ONLY when explicitly requested.
 
 ────────────────────────────────────────
 SCHEDULE-AWARE QUESTION HANDLING (MANDATORY)
@@ -431,6 +460,95 @@ def delete_event_by_ids(service, event_ids):
         except Exception as e:
             print(f"Failed deleting {eid}: {e}")
 
+from datetime import datetime, timedelta
+
+def _dt_from_iso_naive(s: str) -> datetime:
+    """
+    Parse 'YYYY-MM-DDTHH:MM:SS' (no timezone offset) into a naive datetime.
+    """
+    return datetime.fromisoformat(s)
+
+def _parse_event_dt(ev_time_obj: dict) -> datetime | None:
+    """
+    Parse Google event start/end:
+      - dateTime: 'YYYY-MM-DDTHH:MM:SS' (sometimes may include offset or Z)
+      - date: 'YYYY-MM-DD' (all-day)
+    Returns naive datetime.
+    """
+    if not isinstance(ev_time_obj, dict):
+        return None
+
+    dt_s = ev_time_obj.get("dateTime")
+    if dt_s:
+        try:
+            return datetime.fromisoformat(dt_s.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            return None
+
+    d_s = ev_time_obj.get("date")
+    if d_s:
+        try:
+            return datetime.fromisoformat(d_s)  # midnight
+        except Exception:
+            return None
+
+    return None
+
+def _event_overlaps_range(ev: dict, range_from: datetime, range_to: datetime) -> bool:
+    """
+    Overlap check for half-open interval [range_from, range_to):
+      event_start < range_to AND event_end > range_from
+    """
+    s = _parse_event_dt(ev.get("start") or {})
+    e = _parse_event_dt(ev.get("end") or {})
+    if not s or not e:
+        return False
+    return (s < range_to) and (e > range_from)
+
+def _looks_like_delete_all_intent(user_text: str) -> bool:
+    """
+    Detect phrasing like 'delete all events ...' / 'remove all events ...'
+    """
+    t = (user_text or "").strip().lower()
+    if not t:
+        return False
+    return ("delete all" in t) or ("remove all" in t) or ("delete every" in t)
+
+def _has_text_filter(filters: dict) -> bool:
+    """
+    True if filters contain a meaningful 'text' selector.
+    """
+    if not isinstance(filters, dict):
+        return False
+    txt = filters.get("text")
+    return isinstance(txt, str) and txt.strip() != ""
+
+def delete_all_events_overlapping_range(service, from_time: str, to_time: str) -> int:
+    """
+    Deterministic deletion: delete ALL events overlapping [from_time, to_time).
+    Uses a superset fetch window (day boundaries) so overlap events are not missed.
+    Returns number of deletion candidates.
+    """
+    range_from = _dt_from_iso_naive(from_time)
+    range_to   = _dt_from_iso_naive(to_time)
+
+    # Fetch superset window around the range to avoid missing overlap cases.
+    fetch_start = range_from.replace(hour=0, minute=0, second=0, microsecond=0)
+    fetch_end   = range_to.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+
+    items = list_events_in_range(
+        service,
+        fetch_start.isoformat(timespec="seconds"),
+        fetch_end.isoformat(timespec="seconds"),
+    )
+
+    candidates = [ev for ev in items if _event_overlaps_range(ev, range_from, range_to)]
+    ids = [ev.get("id") for ev in candidates if isinstance(ev.get("id"), str) and ev.get("id").strip()]
+
+    if ids:
+        delete_event_by_ids(service, ids)
+
+    return len(ids)
 
 
 """
@@ -441,12 +559,35 @@ def delete_event_by_ids(service, event_ids):
   output: None
 """
 def handle_query(service, question, filters):
+    """
+    Handles both query & deletion-like requests over a given time range.
+
+    Fix:
+    - If the intent is 'delete all events in this time range' (daily deletion / time-window),
+      delete deterministically WITHOUT calling the LLM.
+    - Otherwise, fetch events and use the LLM for selective deletion (IDs) and/or answers.
+    """
     from_time = filters["from"]
     to_time = filters["to"]
 
+    # 1) Deterministic delete-all in range (NO LLM)
+    # We treat it as delete-all when:
+    # - user phrasing clearly indicates delete-all, OR
+    # - there is no text filter at all (common for daily/range deletions).
+    delete_all_mode = _looks_like_delete_all_intent(question) or (not _has_text_filter(filters))
+
+    if delete_all_mode:
+        deleted_count = delete_all_events_overlapping_range(service, from_time, to_time)
+        if deleted_count == 0:
+            print("Answer: No events were found to delete in the requested time range.")
+        else:
+            print(f"Answer: Deleted {deleted_count} events in the requested time range.")
+        return
+
+    # 2) Otherwise: fetch events + use LLM for selective delete / query response
     items = list_events_in_range(service, from_time, to_time)
     if not items:
-        print("Answer: no events found in the given time range.")
+        print("Answer: No events found in the given time range.")
         return
 
     slim = []
@@ -462,50 +603,47 @@ def handle_query(service, question, filters):
         })
 
     sys_msg = (
-    "You are a careful, multilingual calendar analyst. "
-    "You receive a natural-language query and a JSON array of events with keys: "
-    "id, title, start, end, location, description, recurring.\n\n"
+        "You are a careful, multilingual calendar analyst. "
+        "You receive a natural-language query and a JSON array of events with keys: "
+        "id, title, start, end, location, description, recurring.\n\n"
 
-    "Your job:\n"
-    "1) Understand complex intent (query/delete/both), including multi-criteria filters: "
-    "   time ranges, text, people, locations, durations, overlaps, etc.\n"
-    "2) Perform semantic & geographic reasoning WITHOUT external tools: "
-    "   treat phrases like 'near/around/in the area of X' using general world knowledge. "
-    "   Accept neighborhood names, transliterations, common aliases, and nearby cities "
-    "   reasonably associated with X. Do fuzzy matching when sensible.\n"
-    "3) Do calculations: counts, durations, earliest/latest, overlaps/conflicts, totals per day, etc.\n"
-    "4) Recurring events: do not list each occurrence unless explicitly requested. "
-    "   Summarize recurring items at the end (e.g., 'Remember: \"Meditation\" — every morning').\n"
-    "5) Language: detect the user's language from the query and respond in the SAME language. "
-    "   Be polite, concise, and human-like. Use 24-hour time and dd/MM/yyyy dates in the prose.\n"
-    "6) Formatting for multi-line answers: one event per line, sorted by start time, no bullets/markdown.\n\n"
+        "Your job:\n"
+        "1) Understand complex intent (query/delete/both), including multi-criteria filters: "
+        "   time ranges, text, people, locations, durations, overlaps, etc.\n"
+        "2) Perform semantic & geographic reasoning WITHOUT external tools: "
+        "   treat phrases like 'near/around/in the area of X' using general world knowledge. "
+        "   Do fuzzy matching when sensible.\n"
+        "3) Do calculations: counts, durations, earliest/latest, overlaps/conflicts, totals per day, etc.\n"
+        "4) Recurring events: do not list each occurrence unless explicitly requested. Summarize recurring items.\n"
+        "5) Language: detect the user's language from the query and respond in the SAME language.\n"
+        "6) Formatting: if listing multiple events, one per line, sorted by start time, no bullets/markdown.\n\n"
 
-    "CRITICAL CONSTRAINTS:\n"
-    "- You MUST use ONLY the provided Events JSON. Never invent events.\n"
-    "- If deletion is requested, you MUST select events only from the provided list.\n"
-    "- You MUST return event IDs for deletion (not titles), taken from the 'id' field.\n\n"
+        "CRITICAL CONSTRAINTS:\n"
+        "- You MUST use ONLY the provided Events JSON. Never invent events.\n"
+        "- If deletion is requested, you MUST select events only from the provided list.\n"
+        "- You MUST return event IDs for deletion (not titles), copied from the 'id' field.\n\n"
 
-    "Time range & overlap semantics (MANDATORY):\n"
-    "- Consider an event 'within the range' if it overlaps the range:\n"
-    "  event_start < range_to AND event_end > range_from.\n"
-    "- This means you must include events that started before range_from but continue into the range.\n"
-    "- For all-day events represented by date (no time), treat them as spanning the full day.\n\n"
+        "Time range & overlap semantics (MANDATORY):\n"
+        "- Consider an event 'within the range' if it overlaps the range:\n"
+        "  event_start < range_to AND event_end > range_from.\n"
+        "- Include events that started before range_from but continue into the range.\n"
+        "- For all-day events represented by date (no time), treat them as spanning the full day.\n\n"
 
-    "Deletion intent:\n"
-    "- If the user clearly wants deletion, return exact event IDs under \"delete_event_ids\".\n"
-    "- IDs MUST be copied exactly from the provided Events JSON 'id' field.\n"
-    "- Do NOT return titles for deletion.\n"
-    "- You may also include a polite summary in \"answer\".\n\n"
+        "Deletion output:\n"
+        "- If the user clearly wants deletion, return exact event IDs under \"delete_event_ids\".\n"
+        "- IDs MUST be copied exactly from the provided Events JSON.\n"
+        "- Do NOT return titles for deletion.\n"
+        "- You may also include a short summary in \"answer\".\n\n"
 
-    "Output: return a SINGLE valid JSON object only. Allowed keys: "
-    "\"answer\" (string) and/or \"delete_event_ids\" (array of strings). "
-    "If not deleting, omit \"delete_event_ids\". If no answer is needed, omit \"answer\".\n\n"
+        "Output: return a SINGLE valid JSON object only. Allowed keys: "
+        "\"answer\" (string) and/or \"delete_event_ids\" (array of strings). "
+        "If not deleting, omit \"delete_event_ids\". If no answer is needed, omit \"answer\".\n\n"
 
-    "Examples (schema only, DO NOT copy wording):\n"
-    "{ \"answer\": \"...\" }\n"
-    "{ \"answer\": \"...\", \"delete_event_ids\": [\"idA\", \"idB\"] }\n"
-    "{ \"delete_event_ids\": [\"idA\"] }\n"
-          )
+        "Schema examples:\n"
+        "{ \"answer\": \"...\" }\n"
+        "{ \"answer\": \"...\", \"delete_event_ids\": [\"idA\", \"idB\"] }\n"
+        "{ \"delete_event_ids\": [\"idA\"] }\n"
+    )
 
     user_msg = {
         "role": "user",
@@ -534,7 +672,6 @@ def handle_query(service, question, filters):
         print("GPT returned invalid JSON:\n", reply)
         return
 
-    # שולחים לאפליקציה תשובה מלאה (רב-שורתית אם צריך)
     if isinstance(result.get("answer"), str) and result["answer"].strip():
         print("Answer:", result["answer"].strip())
 
@@ -543,6 +680,8 @@ def handle_query(service, question, filters):
         if ids:
             print(f"Preparing to delete {len(ids)} matching events.")
             delete_event_by_ids(service, ids)
+        else:
+            print("Answer: No matching events were selected for deletion.")
 
 
 # ----------------------------- execution layer -----------------------------
@@ -555,8 +694,13 @@ def process_command(service, command_data):
 
     elif cmd == "delete_event":
         filters = command_data["filters"]
-        handle_query(service, f"delete all events matching '{filters['text']}'", filters)
-
+        text = (filters.get("text") or "").strip()
+        # If you can pass the original user prompt here, do it.
+        # Otherwise:
+        if text:
+            handle_query(service, f"Delete events matching: {text}", filters)
+        else:
+            handle_query(service, "Delete all events in the requested time range.", filters)
     elif cmd == "query_event":
         handle_query(service, command_data["question"], command_data["filters"])
 
