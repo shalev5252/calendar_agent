@@ -1,21 +1,27 @@
 # app/main.py
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import io
 from contextlib import redirect_stdout
-
-# ייבוא הקובץ agent.py שנמצא בתיקייה הראשית
 import sys, os
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))  # מאפשר גישה לקובץ agent.py
-import agent
-from tools import get_calendar_service, get_auth_url, exchange_code_for_token  # ← חשוב
+import traceback
 
+# Allow importing agent.py from project root (one level above /app)
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+import agent
+
+from tools import (
+    get_calendar_service,
+    get_auth_url,
+    exchange_code_for_token,
+)
 
 app = FastAPI(title="Google Calendar Agent API", version="1.0")
 
-# הרשה קריאות מהאפליקציה (CORS)
+# CORS (adjust allow_origins in production)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,7 +31,7 @@ app.add_middleware(
 )
 
 # ----------------------------------------------------
-# מודלים (Schemas)
+# Schemas
 # ----------------------------------------------------
 class ParseRequest(BaseModel):
     prompt: str
@@ -36,12 +42,29 @@ class ParseResponse(BaseModel):
 
 class ExecuteRequest(BaseModel):
     actions: List[Dict[str, Any]]
+    original_prompt: str  # IMPORTANT: used for deterministic weekday fixing on the server
 
 class ExecuteResponse(BaseModel):
     ok: bool
     executed: int
-    logs: str | None = None
+    logs: Optional[str] = None
 
+class EventsQuery(BaseModel):
+    from_datetime: str  # "YYYY-MM-DDTHH:MM:SS"
+    to_datetime: str    # "YYYY-MM-DDTHH:MM:SS"
+    time_zone: str = "Asia/Jerusalem"
+    page_size: int = 50
+
+class EventItem(BaseModel):
+    id: str
+    summary: Optional[str] = None
+    start: Optional[Dict[str, Any]] = None
+    end: Optional[Dict[str, Any]] = None
+    recurringEventId: Optional[str] = None
+
+class EventsResponse(BaseModel):
+    ok: bool
+    events: List[EventItem]
 
 # ----------------------------------------------------
 # Endpoints
@@ -54,7 +77,7 @@ def health_check():
 @app.post("/parse", response_model=ParseResponse)
 def parse_prompt(req: ParseRequest):
     """
-    שלב 1 – פירוק הפרומפט לרשימת פעולות בלבד (ללא ביצוע)
+    Step 1: Parse the user prompt into a list of actions (NO execution).
     """
     try:
         actions = agent.plan_actions(req.prompt)
@@ -65,56 +88,42 @@ def parse_prompt(req: ParseRequest):
 
 @app.post("/execute", response_model=ExecuteResponse)
 def execute_actions(req: ExecuteRequest):
-    import io
-    from contextlib import redirect_stdout
-
-    # פונקציה פנימית שמוציאה את ה-payload (אם קיים) לרמה העליונה
+    """
+    Step 2: Execute actions. We ALSO receive the original_prompt so the server can
+    deterministically fix weekday-based requests (next upcoming weekday) before execution.
+    """
     def _unwrap_payload(a: dict) -> dict:
-        """מאחד payload לרמה העליונה אם קיים."""
+        # Flutter may wrap a payload object. Merge it into the top-level.
         if "payload" in a and isinstance(a["payload"], dict):
             merged = {"command": a.get("command")}
             merged.update(a["payload"])
             return merged
         return a
 
-    # ננקה את כל האובייקטים כדי שיתאימו למה ש-agent מצפה
     normalized_actions = [_unwrap_payload(a) for a in req.actions]
 
     buf = io.StringIO()
     try:
         service = get_calendar_service()
+
         with redirect_stdout(buf):
-            agent.execute_actions(normalized_actions, service=service)
+            agent.execute_actions(
+                normalized_actions,
+                service=service,
+                original_prompt=req.original_prompt,  # IMPORTANT
+            )
+
         return ExecuteResponse(ok=True, executed=len(normalized_actions), logs=buf.getvalue())
+
     except Exception as e:
         return ExecuteResponse(ok=False, executed=0, logs=f"Error: {e}\n{buf.getvalue()}")
 
-# ---- הוספה ל-Schemas (ליד שאר ה-Pydantic) ----
-from typing import Optional
 
-class EventsQuery(BaseModel):
-    from_datetime: str  # "YYYY-MM-DDTHH:MM:SS"
-    to_datetime: str    # "YYYY-MM-DDTHH:MM:SS"
-    time_zone: str = "Asia/Jerusalem"
-    page_size: int = 50
-
-class EventItem(BaseModel):
-    id: str
-    summary: Optional[str] = None
-    start: Dict[str, Any] | None = None
-    end: Dict[str, Any] | None = None
-    recurringEventId: Optional[str] = None
-
-class EventsResponse(BaseModel):
-    ok: bool
-    events: List[EventItem]
-
-# ---- הוסף את ה-endpoint עצמו ----
 @app.post("/events", response_model=EventsResponse)
 def list_events(req: EventsQuery):
     """
-    מחזיר אירועים גולמיים מהיומן בטווח תאריכים נתון.
-    השרת ממיר את ה-local datetime ל-RFC3339 עם offset נכון (כולל DST).
+    Returns raw calendar events in a given local datetime range.
+    The server converts local datetime to RFC3339 with correct offset (DST-aware).
     """
     try:
         service = get_calendar_service()
@@ -122,11 +131,11 @@ def list_events(req: EventsQuery):
         time_max = agent._to_rfc3339_with_tz(req.to_datetime, req.time_zone)
 
         result = service.events().list(
-            calendarId='primary',
+            calendarId="primary",
             timeMin=time_min,
             timeMax=time_max,
             singleEvents=True,
-            orderBy='startTime',
+            orderBy="startTime",
             maxResults=req.page_size,
         ).execute()
 
@@ -143,12 +152,11 @@ def list_events(req: EventsQuery):
 
         return EventsResponse(ok=True, events=events)
 
-    except Exception as e:
-        # אפשר להחליף ל-HTTPException(500) אם תרצה לכפות קוד שגיאה
+    except Exception:
         return EventsResponse(ok=False, events=[])
 
 
-# --- OAuth start: מחזיר קישור התחברות ---
+# --- OAuth start: returns auth URL ---
 @app.get("/oauth2/start")
 def oauth2_start():
     try:
@@ -157,10 +165,8 @@ def oauth2_start():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- OAuth callback: גוגל מחזירה ?code= ---
-from fastapi.responses import HTMLResponse
-import traceback
 
+# --- OAuth callback: Google returns ?code= ---
 @app.get("/oauth2callback")
 def oauth2_callback(code: str | None = None):
     if not code:
@@ -174,7 +180,6 @@ def oauth2_callback(code: str | None = None):
         <body>
             <h3>Login completed. Returning to the app…</h3>
             <script>
-                // Redirect back to Flutter app
                 window.location.href = "myapp://oauth-complete";
             </script>
         </body>
@@ -191,14 +196,13 @@ def oauth2_callback(code: str | None = None):
 @app.get("/auth/status")
 def auth_status():
     """
-    בודק אם קיימת הרשאת Google Calendar תקפה.
-    מחזיר:
-    { "ok": true } אם יש token תקין
-    { "ok": false } אם אין או פג תוקף
+    Checks whether a valid Google Calendar auth exists.
+    Returns:
+      { "ok": true } if token is valid
+      { "ok": false } otherwise
     """
     try:
-        service = get_calendar_service()   # יזרוק חריגה אם אין הרשאה
-        # בדיקה בסיסית שמבצעת קריאה קטנה ליומן
+        service = get_calendar_service()  # raises if not authorized
         service.calendarList().list(maxResults=1).execute()
         return {"ok": True}
     except Exception:

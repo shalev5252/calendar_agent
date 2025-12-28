@@ -846,13 +846,9 @@ def process_command(service, command_data: dict, original_prompt: str = "") -> N
         print("Unknown command:", cmd)
 
 
-def execute_actions(actions: List[Dict[str, Any]], service, original_prompt: str = "") -> None:
-    # 1) Enforce weekday correctness BEFORE timezone offsets are added
+def execute_actions(actions: List[Dict[str, Any]], service, original_prompt: str) -> None:
     actions = fix_actions_with_user_prompt(original_prompt, actions)
-
-    # 2) Normalize to RFC3339 with correct offset for Google Calendar API
     actions = normalize_actions_timezone(actions)
-
     for action in actions:
         process_command(service, action, original_prompt=original_prompt)
 
