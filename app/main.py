@@ -1,27 +1,23 @@
 # app/main.py
-from fastapi import FastAPI, HTTPException
+from __future__ import annotations
+
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
 import io
 from contextlib import redirect_stdout
-import sys, os
 import traceback
+import sys, os
 
-# Allow importing agent.py from project root (one level above /app)
+# allow importing agent.py from project root
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-import agent
 
-from tools import (
-    get_calendar_service,
-    get_auth_url,
-    exchange_code_for_token,
-)
+import agent
+from tools import get_calendar_service, get_auth_url, exchange_code_for_token
 
 app = FastAPI(title="Google Calendar Agent API", version="1.0")
 
-# CORS (adjust allow_origins in production)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,105 +26,96 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----------------------------------------------------
-# Schemas
-# ----------------------------------------------------
-class ParseRequest(BaseModel):
-    prompt: str
 
-class ParseResponse(BaseModel):
-    ok: bool
-    actions: List[Dict[str, Any]]
-
-class ExecuteRequest(BaseModel):
-    actions: List[Dict[str, Any]]
-    original_prompt: str  # IMPORTANT: used for deterministic weekday fixing on the server
-
-class ExecuteResponse(BaseModel):
-    ok: bool
-    executed: int
-    logs: Optional[str] = None
-
-class EventsQuery(BaseModel):
-    from_datetime: str  # "YYYY-MM-DDTHH:MM:SS"
-    to_datetime: str    # "YYYY-MM-DDTHH:MM:SS"
-    time_zone: str = "Asia/Jerusalem"
-    page_size: int = 50
-
-class EventItem(BaseModel):
-    id: str
-    summary: Optional[str] = None
-    start: Optional[Dict[str, Any]] = None
-    end: Optional[Dict[str, Any]] = None
-    recurringEventId: Optional[str] = None
-
-class EventsResponse(BaseModel):
-    ok: bool
-    events: List[EventItem]
-
-# ----------------------------------------------------
-# Endpoints
-# ----------------------------------------------------
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
 
 
-@app.post("/parse", response_model=ParseResponse)
-def parse_prompt(req: ParseRequest):
+def _unwrap_payload(a: dict) -> dict:
     """
-    Step 1: Parse the user prompt into a list of actions (NO execution).
+    If Flutter sends {command:..., payload:{...}}, flatten it.
+    """
+    if isinstance(a, dict) and "payload" in a and isinstance(a["payload"], dict):
+        merged = {"command": a.get("command")}
+        merged.update(a["payload"])
+        return merged
+    return a
+
+
+@app.post("/parse")
+def parse_prompt(payload: Dict[str, Any] = Body(...)):
+    """
+    Input:
+      { "prompt": "..." }
+    Output:
+      { "ok": true, "actions": [...] }
     """
     try:
-        actions = agent.plan_actions(req.prompt)
-        return ParseResponse(ok=True, actions=actions)
+        prompt = payload.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise HTTPException(status_code=400, detail="Missing 'prompt' string")
+
+        actions = agent.plan_actions(prompt)
+        return {"ok": True, "actions": actions}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/execute", response_model=ExecuteResponse)
-def execute_actions(req: ExecuteRequest):
+@app.post("/execute")
+def execute_actions(payload: Dict[str, Any] = Body(...)):
     """
-    Step 2: Execute actions. We ALSO receive the original_prompt so the server can
-    deterministically fix weekday-based requests (next upcoming weekday) before execution.
+    Input:
+      { "actions": [ ... ] }
+    Output:
+      { "ok": true, "executed": N, "logs": "..." }
     """
-    def _unwrap_payload(a: dict) -> dict:
-        # Flutter may wrap a payload object. Merge it into the top-level.
-        if "payload" in a and isinstance(a["payload"], dict):
-            merged = {"command": a.get("command")}
-            merged.update(a["payload"])
-            return merged
-        return a
-
-    normalized_actions = [_unwrap_payload(a) for a in req.actions]
-
     buf = io.StringIO()
     try:
+        actions_raw = payload.get("actions")
+        if not isinstance(actions_raw, list):
+            raise HTTPException(status_code=400, detail="Missing 'actions' array")
+
+        normalized_actions = [_unwrap_payload(a) for a in actions_raw if isinstance(a, dict)]
+
         service = get_calendar_service()
-
         with redirect_stdout(buf):
-            agent.execute_actions(
-                normalized_actions,
-                service=service,
-                original_prompt=req.original_prompt,  # IMPORTANT
-            )
+            agent.execute_actions(normalized_actions, service=service)
 
-        return ExecuteResponse(ok=True, executed=len(normalized_actions), logs=buf.getvalue())
-
+        return {"ok": True, "executed": len(normalized_actions), "logs": buf.getvalue()}
+    except HTTPException as e:
+        return {"ok": False, "executed": 0, "logs": f"Error: {e.detail}\n{buf.getvalue()}"}
     except Exception as e:
-        return ExecuteResponse(ok=False, executed=0, logs=f"Error: {e}\n{buf.getvalue()}")
+        return {"ok": False, "executed": 0, "logs": f"Error: {e}\n{buf.getvalue()}"}
 
 
-@app.post("/events", response_model=EventsResponse)
-def list_events(req: EventsQuery):
+@app.post("/events")
+def list_events(payload: Dict[str, Any] = Body(...)):
     """
-    Returns raw calendar events in a given local datetime range.
-    The server converts local datetime to RFC3339 with correct offset (DST-aware).
+    Input:
+      {
+        "from_datetime": "YYYY-MM-DDTHH:MM:SS",
+        "to_datetime": "YYYY-MM-DDTHH:MM:SS",
+        "time_zone": "Asia/Jerusalem",
+        "page_size": 50
+      }
+    Output:
+      { "ok": true, "events": [ ... ] }
     """
     try:
+        from_dt = payload.get("from_datetime")
+        to_dt = payload.get("to_datetime")
+        tz = payload.get("time_zone") or "Asia/Jerusalem"
+        page_size = payload.get("page_size") or 50
+
+        if not isinstance(from_dt, str) or not isinstance(to_dt, str):
+            raise HTTPException(status_code=400, detail="from_datetime/to_datetime must be strings")
+
         service = get_calendar_service()
-        time_min = agent._to_rfc3339_with_tz(req.from_datetime, req.time_zone)
-        time_max = agent._to_rfc3339_with_tz(req.to_datetime, req.time_zone)
+        time_min = agent._to_rfc3339_with_tz(from_dt, tz)
+        time_max = agent._to_rfc3339_with_tz(to_dt, tz)
 
         result = service.events().list(
             calendarId="primary",
@@ -136,7 +123,7 @@ def list_events(req: EventsQuery):
             timeMax=time_max,
             singleEvents=True,
             orderBy="startTime",
-            maxResults=req.page_size,
+            maxResults=int(page_size),
         ).execute()
 
         items = result.get("items", [])
@@ -150,13 +137,13 @@ def list_events(req: EventsQuery):
                 "recurringEventId": it.get("recurringEventId"),
             })
 
-        return EventsResponse(ok=True, events=events)
+        return {"ok": True, "events": events}
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"ok": False, "events": [], "error": str(e)}
 
-    except Exception:
-        return EventsResponse(ok=False, events=[])
 
-
-# --- OAuth start: returns auth URL ---
 @app.get("/oauth2/start")
 def oauth2_start():
     try:
@@ -166,15 +153,13 @@ def oauth2_start():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- OAuth callback: Google returns ?code= ---
 @app.get("/oauth2callback")
-def oauth2_callback(code: str | None = None):
+def oauth2_callback(code: Optional[str] = None):
     if not code:
         return HTMLResponse("<h3>Missing ?code</h3>", status_code=400)
 
     try:
         exchange_code_for_token(code)
-
         html = """
         <html>
         <body>
@@ -186,7 +171,6 @@ def oauth2_callback(code: str | None = None):
         </html>
         """
         return HTMLResponse(html, status_code=200)
-
     except Exception as e:
         tb = traceback.format_exc()
         print("OAUTH ERROR:", e, tb)
@@ -195,14 +179,8 @@ def oauth2_callback(code: str | None = None):
 
 @app.get("/auth/status")
 def auth_status():
-    """
-    Checks whether a valid Google Calendar auth exists.
-    Returns:
-      { "ok": true } if token is valid
-      { "ok": false } otherwise
-    """
     try:
-        service = get_calendar_service()  # raises if not authorized
+        service = get_calendar_service()
         service.calendarList().list(maxResults=1).execute()
         return {"ok": True}
     except Exception:
