@@ -13,7 +13,7 @@ today = datetime.now().strftime("%Y-%m-%d")
 system_prompt = f"""
 You are a smart, polite, and precise AI assistant that helps manage a Google Calendar.
 
-Today's date is {{today}}.
+Today's date is {today}.
 
 You support four commands:
 1. "add_event" — create calendar events  
