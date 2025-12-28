@@ -377,6 +377,7 @@ def add_event(service, event_json):
           titles_to_delete - list of event titles to delete
   output: None
 """
+
 def delete_event_by_titles(service, from_time, to_time, titles_to_delete):
     events_result = service.events().list(
         calendarId='primary',
@@ -396,6 +397,41 @@ def delete_event_by_titles(service, from_time, to_time, titles_to_delete):
             except Exception as e:
                 print(f"Failed to delete '{title}': {e}")
 
+def list_events_in_range(service, from_time, to_time):
+    events = []
+    page_token = None
+
+    while True:
+        res = service.events().list(
+            calendarId="primary",
+            timeMin=from_time,
+            timeMax=to_time,
+            singleEvents=True,
+            orderBy="startTime",
+            pageToken=page_token
+        ).execute()
+
+        events.extend(res.get("items", []))
+        page_token = res.get("nextPageToken")
+
+        if not page_token:
+            break
+
+    return events
+
+
+def delete_event_by_ids(service, event_ids):
+    for eid in event_ids:
+        eid = (eid or "").strip().strip('"').strip("'")
+        if not eid:
+            continue
+        try:
+            service.events().delete(calendarId="primary", eventId=eid).execute()
+            print(f"Deleted: {eid}")
+        except Exception as e:
+            print(f"Failed deleting {eid}: {e}")
+
+
 
 """
   the function will handle a query command: it will fetch events in the given time range, use the LLM to process the question and print the answer.
@@ -408,15 +444,7 @@ def handle_query(service, question, filters):
     from_time = filters["from"]
     to_time = filters["to"]
 
-    events_result = service.events().list(
-        calendarId='primary',
-        timeMin=from_time,
-        timeMax=to_time,
-        singleEvents=True,
-        orderBy='startTime'
-    ).execute()
-
-    items = events_result.get('items', [])
+    items = list_events_in_range(service, from_time, to_time)
     if not items:
         print("Answer: no events found in the given time range.")
         return
@@ -424,6 +452,7 @@ def handle_query(service, question, filters):
     slim = []
     for ev in items:
         slim.append({
+            "id": ev.get("id") or "",
             "title": ev.get("summary") or "",
             "start": ev.get("start", {}).get("dateTime") or ev.get("start", {}).get("date"),
             "end": ev.get("end", {}).get("dateTime") or ev.get("end", {}).get("date"),
@@ -433,37 +462,50 @@ def handle_query(service, question, filters):
         })
 
     sys_msg = (
-        "You are a careful, multilingual calendar analyst. "
-        "You receive a natural-language query and a JSON array of events with keys: "
-        "title, start, end, location, description, recurring.\n\n"
+    "You are a careful, multilingual calendar analyst. "
+    "You receive a natural-language query and a JSON array of events with keys: "
+    "id, title, start, end, location, description, recurring.\n\n"
 
-        "Your job:\n"
-        "1) Understand complex intent (query/delete/both), including multi-criteria filters: "
-        "   time ranges, text, people, locations, durations, overlaps, etc.\n"
-        "2) Perform semantic & geographic reasoning WITHOUT external tools: "
-        "   treat phrases like 'near/around/in the area of X' using general world knowledge. "
-        "   Accept neighborhood names, transliterations, common aliases, and nearby cities "
-        "   reasonably associated with X. Do fuzzy matching when sensible.\n"
-        "3) Do calculations: counts, durations, earliest/latest, overlaps/conflicts, totals per day, etc.\n"
-        "4) Recurring events: do not list each occurrence unless explicitly requested. "
-        "   Summarize recurring items at the end (e.g., 'Remember: \"Meditation\" — every morning').\n"
-        "5) Language: detect the user's language from the query and respond in the SAME language. "
-        "   Be polite, concise, and human-like. Use 24-hour time and dd/MM/yyyy dates in the prose.\n"
-        "6) Formatting for multi-line answers: one event per line, sorted by start time, no bullets/markdown.\n\n"
+    "Your job:\n"
+    "1) Understand complex intent (query/delete/both), including multi-criteria filters: "
+    "   time ranges, text, people, locations, durations, overlaps, etc.\n"
+    "2) Perform semantic & geographic reasoning WITHOUT external tools: "
+    "   treat phrases like 'near/around/in the area of X' using general world knowledge. "
+    "   Accept neighborhood names, transliterations, common aliases, and nearby cities "
+    "   reasonably associated with X. Do fuzzy matching when sensible.\n"
+    "3) Do calculations: counts, durations, earliest/latest, overlaps/conflicts, totals per day, etc.\n"
+    "4) Recurring events: do not list each occurrence unless explicitly requested. "
+    "   Summarize recurring items at the end (e.g., 'Remember: \"Meditation\" — every morning').\n"
+    "5) Language: detect the user's language from the query and respond in the SAME language. "
+    "   Be polite, concise, and human-like. Use 24-hour time and dd/MM/yyyy dates in the prose.\n"
+    "6) Formatting for multi-line answers: one event per line, sorted by start time, no bullets/markdown.\n\n"
 
-        "Deletion intent:\n"
-        "- If the user clearly wants deletion, return exact titles under \"delete_titles\". "
-        "  You may also include a polite summary in \"answer\".\n\n"
+    "CRITICAL CONSTRAINTS:\n"
+    "- You MUST use ONLY the provided Events JSON. Never invent events.\n"
+    "- If deletion is requested, you MUST select events only from the provided list.\n"
+    "- You MUST return event IDs for deletion (not titles), taken from the 'id' field.\n\n"
 
-        "Output: return a SINGLE valid JSON object only. Allowed keys: "
-        "\"answer\" (string) and/or \"delete_titles\" (array of strings). "
-        "If not deleting, omit \"delete_titles\". If no answer is needed, omit \"answer\".\n\n"
+    "Time range & overlap semantics (MANDATORY):\n"
+    "- Consider an event 'within the range' if it overlaps the range:\n"
+    "  event_start < range_to AND event_end > range_from.\n"
+    "- This means you must include events that started before range_from but continue into the range.\n"
+    "- For all-day events represented by date (no time), treat them as spanning the full day.\n\n"
 
-        "Examples (schema only, DO NOT copy wording):\n"
-        "{ \"answer\": \"...\" }\n"
-        "{ \"answer\": \"...\", \"delete_titles\": [\"Title A\", \"Title B\"] }\n"
-        "{ \"delete_titles\": [\"Title A\"] }\n"
-    )
+    "Deletion intent:\n"
+    "- If the user clearly wants deletion, return exact event IDs under \"delete_event_ids\".\n"
+    "- IDs MUST be copied exactly from the provided Events JSON 'id' field.\n"
+    "- Do NOT return titles for deletion.\n"
+    "- You may also include a polite summary in \"answer\".\n\n"
+
+    "Output: return a SINGLE valid JSON object only. Allowed keys: "
+    "\"answer\" (string) and/or \"delete_event_ids\" (array of strings). "
+    "If not deleting, omit \"delete_event_ids\". If no answer is needed, omit \"answer\".\n\n"
+
+    "Examples (schema only, DO NOT copy wording):\n"
+    "{ \"answer\": \"...\" }\n"
+    "{ \"answer\": \"...\", \"delete_event_ids\": [\"idA\", \"idB\"] }\n"
+    "{ \"delete_event_ids\": [\"idA\"] }\n"
+          )
 
     user_msg = {
         "role": "user",
@@ -496,12 +538,12 @@ def handle_query(service, question, filters):
     if isinstance(result.get("answer"), str) and result["answer"].strip():
         print("Answer:", result["answer"].strip())
 
-    # מחיקה לפי כותרות (אופציונלי)
-    if isinstance(result.get("delete_titles"), list):
-        delete_titles = [t for t in result["delete_titles"] if isinstance(t, str) and t.strip()]
-        if delete_titles:
-            print(f"Preparing to delete {len(delete_titles)} matching titles.")
-            delete_event_by_titles(service, from_time, to_time, delete_titles)
+    if isinstance(result.get("delete_event_ids"), list):
+        ids = [x for x in result["delete_event_ids"] if isinstance(x, str) and x.strip()]
+        if ids:
+            print(f"Preparing to delete {len(ids)} matching events.")
+            delete_event_by_ids(service, ids)
+
 
 # ----------------------------- execution layer -----------------------------
 
