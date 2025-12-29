@@ -9,11 +9,24 @@ from typing import Any, Dict, List, Optional
 
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-today = datetime.now().strftime("%Y-%m-%d")
-system_prompt = f"""
-You are a smart and polite AI assistant helping manage a Google Calendar.
-Today's date is {today}.
+from zoneinfo import ZoneInfo
 
+LOCAL_TZ = ZoneInfo("Asia/Jerusalem")
+
+def now_local() -> datetime:
+    return datetime.now(tz=LOCAL_TZ)
+
+def build_system_prompt() -> str:
+    now = now_local()
+    today = now.date().isoformat()
+    now_iso = now.isoformat(timespec="seconds")
+    dow = now.strftime("%A")
+    return f"""
+You are a smart and polite AI assistant helping manage a Google Calendar.
+
+Current local datetime (Asia/Jerusalem): {now_iso}
+Today's date is {today}.
+Day of week: {dow}.
 You support four commands:
 1. "add_event" — to create calendar events
 2. "delete_event" — to delete events by text filter and date range
@@ -106,12 +119,15 @@ For general knowledge (non-calendar):
 }}
 
 Rules:
+- For relative date words (today/tomorrow/this week), you MUST anchor them to Today's date above (Asia/Jerusalem)
 - Automatically detect the user's language. It can be any language (English, Hebrew, Arabic, Spanish, French, Japanese, etc.).
 - Always respond in the **same language** used by the user.
 - Responses must be **polite, clear, and human-like**, as if written by a friendly personal assistant.
 - If the question mixes multiple languages, choose the dominant one.
 - Never translate the user's text — answer naturally in their original language.
 - Keep tone warm, respectful, and professional, while still natural and concise.
+- Never output dates in the past unless the user explicitly asked for a past date.
+- When the user gives a weekday without a date (e.g., “Friday at 08:00”), interpret it as the next occurrence relative to Today’s date above (Asia/Jerusalem), including year rollover
 
 Formatting for multiple items:
 - When listing more than one item (for example, multiple events, tasks, or answers), each item must appear on its **own line**.
@@ -296,7 +312,7 @@ def parse_event(prompt: str) -> Dict[str, Any]:
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": build_system_prompt()},
             {"role": "user", "content": prompt}
         ]
     )
@@ -693,7 +709,7 @@ def _ensure_all_day_dates(event_obj: dict) -> dict:
     s_date = _extract_date(start)
     if not s_date:
         # אם לא נמסר start בכלל, נשתמש בהיום
-        s_date = datetime.now().date()
+        s_date = now_local().date()
 
     e_date = s_date + timedelta(days=1)
 
